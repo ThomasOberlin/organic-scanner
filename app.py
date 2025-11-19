@@ -17,8 +17,10 @@ SIMULATION_MODE = True
 YOUR_TOKEN_ID = "0x123_PLACEHOLDER"
 
 # --- KEYWORDS ---
+# UPDATED: Added "certificate valid", "valid from", "valid to"
 EXPIRY_KEYWORDS = [
     "valid until", "expiry date", "date of expiry", "validity", "expires",
+    "certificate valid", "valid from", "valid to", 
     "gültig bis", "ablaufdatum", "valable jusqu'au", "date d'expiration",
     "data di scadenza", "valido fino al", "fecha de caducidad", "válido hasta",
     "geldig tot", "vervaldatum", "válido até", "data de validade"
@@ -65,7 +67,10 @@ def find_date(text):
         line_lower = line.lower()
         for kw in EXPIRY_KEYWORDS:
             if kw in line_lower:
+                # Check this line and the next line for the date
                 scan_text = line + " " + (lines[i+1] if i+1 < len(lines) else "")
+                
+                # Regex looks for dates like DD.MM.YYYY or DD/MM/YYYY
                 match = re.search(r'(\d{1,2}[./-]\d{1,2}[./-]\d{2,4})', scan_text)
                 if match:
                     try:
@@ -110,7 +115,6 @@ if wallet_address:
 if has_access:
     st.title("🌱 Organic Certificate Scanner")
     
-    # --- EVIDENCE OF LANGUAGES ---
     st.info("✅ **Active Languages:** English, German, French, Italian, Spanish, Dutch, Portuguese")
     
     uploaded_file = st.file_uploader("Upload Certificate", type=['png', 'jpg', 'pdf'])
@@ -133,15 +137,15 @@ if has_access:
                 if expiry:
                     days = (expiry - datetime.now()).days
                     st.metric("Expiration", expiry.strftime("%Y-%m-%d"), f"{days} days")
-                    if days < 0: st.error("EXPIRED")
+                    if days < 0: st.error("❌ CERTIFICATE EXPIRED")
                     elif days < 60: st.error("⚠️ Expires < 60 days")
-                else: st.warning("Date not found.")
+                    elif days < 90: st.warning("⚠️ Expires < 90 days")
+                else: st.warning("Date not found in document.")
             
             with c2:
                 st.subheader("Farm Details")
                 st.info(farm)
                 
-                # DEBUG EXPANDER
                 with st.expander("🔍 View Raw Scanned Text"):
                     st.write(text)
 else:
