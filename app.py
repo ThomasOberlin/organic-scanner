@@ -13,8 +13,8 @@ SIMULATION_MODE = True
 # --- INITIALIZE PADDLE OCR ---
 @st.cache_resource
 def get_ocr_engine():
-    # FIXED: Removed ALL extra arguments that cause version conflicts.
-    # We only keep the essential ones.
+    # We set use_angle_cls=True here ONCE. 
+    # We do not need to pass it again during scanning.
     return PaddleOCR(use_angle_cls=True, lang='en')
 
 ocr_engine = get_ocr_engine()
@@ -34,9 +34,8 @@ def find_anchor_y(ocr_data, keywords):
     # Paddle format: [ [ [ [x1,y1]..], ("text", conf) ] ... ]
     if not ocr_data: return None
     for line in ocr_data:
-        box = line[0]
-        text_obj = line[1]
-        text = text_obj[0].lower()
+        box, (text, conf) = line
+        text = text.lower()
         if any(kw in text for kw in keywords):
             return int(box[0][1])
     return None
@@ -58,8 +57,8 @@ def surgical_crop(img, y_start, y_end, split_vertical=False, side="left"):
         crop = img.crop((x_start, y_start, x_end, y_end))
         crop_np = pil_to_numpy(crop)
         
-        # Run OCR without 'cls' argument to be safe
-        result = ocr_engine.ocr(crop_np, cls=False)
+        # FIXED: Removed 'cls=' argument completely
+        result = ocr_engine.ocr(crop_np)
         
         full_text = ""
         if result and result[0]:
@@ -87,7 +86,9 @@ def extract_full_data_paddle(file):
 
         # 1. Get Landmarks (Full Page Scan)
         img_np = pil_to_numpy(img)
-        raw_results = ocr_engine.ocr(img_np, cls=True)
+        
+        # FIXED: Removed 'cls=' argument completely
+        raw_results = ocr_engine.ocr(img_np)
         
         flat_text = ""
         ocr_list = []
@@ -115,7 +116,8 @@ def extract_full_data_paddle(file):
         products_text = ""
         if file.type == "application/pdf" and 'images' in locals() and len(images) > 1:
             p2_np = pil_to_numpy(prod_img)
-            p2_res = ocr_engine.ocr(p2_np, cls=False)
+            # FIXED: Removed 'cls=' argument completely
+            p2_res = ocr_engine.ocr(p2_np)
             if p2_res and p2_res[0]:
                 for line in p2_res[0]: products_text += line[1][0] + "\n"
         else:
