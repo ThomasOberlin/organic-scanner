@@ -14,9 +14,7 @@ SIMULATION_MODE = True
 
 # --- IMAGE PROCESSING ---
 def preprocess_image(img):
-    """
-    High-contrast B&W for OCR accuracy.
-    """
+    """High-contrast B&W for OCR accuracy."""
     img = ImageOps.grayscale(img)
     enhancer = ImageEnhance.Contrast(img)
     img = enhancer.enhance(2.0)
@@ -32,91 +30,73 @@ def find_anchor_y(ocr_data, keywords):
     n_boxes = len(ocr_data['text'])
     for i in range(n_boxes):
         if any(kw in ocr_data['text'][i].lower() for kw in keywords):
-            # Lower confidence threshold to catch headers
             if int(ocr_data['conf'][i]) > 40:
                 return ocr_data['top'][i]
     return None
 
 def surgical_crop(img, y_start, y_end, split_vertical=False, side="left"):
-    """
-    Cuts specific zones of the image with CRASH PROTECTION.
-    """
+    """Cuts specific zones of the image."""
     w, h = img.size
-    
-    # 1. Default values if missing
     if y_start is None: y_start = 0
     if y_end is None: y_end = h
     
-    # 2. CRASH FIX: Ensure Bottom is below Top
-    if y_end <= y_start:
-        y_end = min(y_start + 500, h) # Force 500px height if calculation fails
-    
-    # 3. Define Left/Right boundaries
+    # Safety: Ensure Bottom is below Top
+    if y_end <= y_start: y_end = min(y_start + 500, h)
+
+    # Crop X-axis (Left/Right/Full)
     if split_vertical:
         x_start = 0 if side == "left" else int(w * 0.5)
         x_end = int(w * 0.5) if side == "left" else w
     else:
         x_start, x_end = 0, w
         
-    # 4. Perform Crop
-    try:
-        crop = img.crop((x_start, y_start, x_end, y_end))
-        return pytesseract.image_to_string(crop, lang=LANGUAGES_CONFIG, config='--psm 6')
-    except Exception:
-        return ""
+    crop = img.crop((x_start, y_start, x_end, y_end))
+    
+    # psm 6 = Assume a single uniform block of text
+    return pytesseract.image_to_string(crop, lang=LANGUAGES_CONFIG, config='--psm 6')
 
 def extract_full_data_spatial(file):
-    """
-    Combines Spatial Extraction (for Grid Layouts) with Memory-Safe scanning.
-    """
+    """Combines Spatial Extraction with Full Page scanning."""
     full_text = ""
     ocr_data = None
     
     try:
-        # Convert to Image
+        # Convert to Image (Memory Safe)
         if file.type == "application/pdf":
-            # MEMORY FIX: Only convert first 2 pages to prevent Server Crash
             images = convert_from_bytes(file.read(), dpi=300, first_page=1, last_page=2)
             img = preprocess_image(images[0])
-            # Use Page 2 for products if available
             prod_img = preprocess_image(images[1]) if len(images) > 1 else img
         else:
             img = Image.open(file)
-            # Resize small images
             if img.width < 2000:
                 img = img.resize((img.width * 2, img.height * 2))
             img = preprocess_image(img)
             prod_img = img
 
-        # 1. Get Landmarks from Page 1
+        # 1. Get Landmarks
         ocr_data = pytesseract.image_to_data(img, output_type=Output.DICT)
         full_text = pytesseract.image_to_string(img)
         
         h = img.height
         
-        # Find Anchors (TRACES format: 1.3, 1.5, etc.)
-        y_box_3 = find_anchor_y(ocr_data, ["1.3", "3.", "address", "operator"]) or int(h * 0.15)
-        y_box_5 = find_anchor_y(ocr_data, ["1.5", "5.", "activity", "activities"]) 
-        
-        # Fallback if "Activity" isn't found
+        # Find Anchors
+        y_box_3 = find_anchor_y(ocr_data, ["1.3", "3.", "address"]) or int(h * 0.15)
+        y_box_5 = find_anchor_y(ocr_data, ["1.5", "5.", "activity"]) 
         if not y_box_5: y_box_5 = int(h * 0.50)
-
+        
         y_box_6 = find_anchor_y(ocr_data, ["1.6", "6.", "category"]) or int(h * 0.60)
         y_footer = int(h * 0.95)
 
         # 2. Extract Zones
-        # Header (Doc Num)
         header_text = surgical_crop(img, 0, y_box_3, split_vertical=False)
         
-        # Columns (Operator vs Authority)
-        # Start slightly below the header line
+        # Columns (Operator Left, Authority Right)
         y_cols_start = y_box_3 + 50 
-        
         operator_text = surgical_crop(img, y_cols_start, y_box_5, split_vertical=True, side="left")
         authority_text = surgical_crop(img, y_cols_start, y_box_5, split_vertical=True, side="right")
         
-        # Products (Bottom of Page 1 OR Page 2)
-        if file.type == "application/pdf" and len(images) > 1:
+        # Products (From Bottom Page 1 OR Page 2)
+        if file.type == "application/pdf" and 'images' in locals() and len(images) > 1:
              products_text = pytesseract.image_to_string(prod_img, lang=LANGUAGES_CONFIG, config='--psm 6')
         else:
              products_text = surgical_crop(img, y_box_6, y_footer, split_vertical=False)
@@ -135,7 +115,7 @@ def extract_full_data_spatial(file):
 
 # --- PARSING HELPERS ---
 def parse_checkbox_products(text):
-    """Clean list of active products"""
+    """Clean list of active products."""
     lines = text.split('\n')
     active = []
     checked_marks = ['X', 'x', 'V', '8', '☑', '[x]']
@@ -144,16 +124,14 @@ def parse_checkbox_products(text):
     for line in lines:
         l = line.strip()
         l_low = l.lower()
-        
-        if "page" in l_low and "from" in l_low: continue
-        if "regulation" in l_low: continue
+        if "page" in l_low or "regulation" in l_low: continue
 
-        # Keep Headers
+        # Headers
         if l_low.startswith(categories):
             active.append(l)
             continue
             
-        # Keep Checked Items
+        # Checked Items
         is_checked = False
         if any(l.startswith(m) for m in checked_marks): is_checked = True
         if "organic" in l_low and not l.startswith("O") and not l.startswith("0"): is_checked = True
@@ -203,7 +181,7 @@ def validate_compliance(data):
         report["score"] += 1
         report["details"].append(f"✅ (2) Control Body Code: {cb_code.group(0)}")
     else:
-        report["details"].append("⚠️ (2) Control Body Code not explicitly found in box")
+        report["details"].append("⚠️ (2) Control Body Code not explicitly found")
 
     # 4. Activities
     if "activity" in data['full_text'].lower():
@@ -266,7 +244,6 @@ if wallet:
             if data:
                 report, products = validate_compliance(data)
 
-                # Results
                 st.markdown("### 📋 10-Point Compliance Check")
                 if report['score'] >= 7:
                     st.success(f"PASSING SCORE: {report['score']}/{report['total']}")
@@ -286,7 +263,7 @@ if wallet:
                     st.subheader("⚖️ Authority (Box 3)")
                     st.warning(data['authority'])
 
-                st.subheader("📦 Validated Products (Box 6)")
+                st.subheader("📦 Validated Products")
                 if products:
                     for p in products: st.markdown(f"- {p}")
                 else:
