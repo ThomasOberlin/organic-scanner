@@ -32,31 +32,42 @@ def find_anchor_y(ocr_data, keywords):
     n_boxes = len(ocr_data['text'])
     for i in range(n_boxes):
         if any(kw in ocr_data['text'][i].lower() for kw in keywords):
+            # Lower confidence threshold to catch headers
             if int(ocr_data['conf'][i]) > 40:
                 return ocr_data['top'][i]
     return None
 
 def surgical_crop(img, y_start, y_end, split_vertical=False, side="left"):
-    """Cuts specific zones of the image."""
+    """
+    Cuts specific zones of the image with CRASH PROTECTION.
+    """
     w, h = img.size
+    
+    # 1. Default values if missing
     if y_start is None: y_start = 0
     if y_end is None: y_end = h
     
-    # Crop X-axis (Left/Right/Full)
+    # 2. CRASH FIX: Ensure Bottom is below Top
+    if y_end <= y_start:
+        y_end = min(y_start + 500, h) # Force 500px height if calculation fails
+    
+    # 3. Define Left/Right boundaries
     if split_vertical:
         x_start = 0 if side == "left" else int(w * 0.5)
         x_end = int(w * 0.5) if side == "left" else w
     else:
         x_start, x_end = 0, w
         
-    crop = img.crop((x_start, y_start, x_end, y_end))
-    
-    # psm 6 = Assume a single uniform block of text
-    return pytesseract.image_to_string(crop, lang=LANGUAGES_CONFIG, config='--psm 6')
+    # 4. Perform Crop
+    try:
+        crop = img.crop((x_start, y_start, x_end, y_end))
+        return pytesseract.image_to_string(crop, lang=LANGUAGES_CONFIG, config='--psm 6')
+    except Exception:
+        return ""
 
 def extract_full_data_spatial(file):
     """
-    Combines Spatial Extraction (for Grid Layouts) with Full Page scanning.
+    Combines Spatial Extraction (for Grid Layouts) with Memory-Safe scanning.
     """
     full_text = ""
     ocr_data = None
@@ -64,13 +75,14 @@ def extract_full_data_spatial(file):
     try:
         # Convert to Image
         if file.type == "application/pdf":
-            # MEMORY FIX: Only convert first 2 pages
+            # MEMORY FIX: Only convert first 2 pages to prevent Server Crash
             images = convert_from_bytes(file.read(), dpi=300, first_page=1, last_page=2)
             img = preprocess_image(images[0])
-            # Scan Page 2 separately if it exists
+            # Use Page 2 for products if available
             prod_img = preprocess_image(images[1]) if len(images) > 1 else img
         else:
             img = Image.open(file)
+            # Resize small images
             if img.width < 2000:
                 img = img.resize((img.width * 2, img.height * 2))
             img = preprocess_image(img)
@@ -80,24 +92,30 @@ def extract_full_data_spatial(file):
         ocr_data = pytesseract.image_to_data(img, output_type=Output.DICT)
         full_text = pytesseract.image_to_string(img)
         
-        # Find "Box 3" (Authority) and "Box 5" (Activity)
-        # We assume standard EU Layout vertical ordering
-        y_box_3 = find_anchor_y(ocr_data, ["3.", "address"]) or int(img.height * 0.15)
-        y_box_5 = find_anchor_y(ocr_data, ["5.", "activity"]) or int(img.height * 0.45)
-        y_box_6 = find_anchor_y(ocr_data, ["6.", "category"]) or int(img.height * 0.60)
-        y_footer = int(img.height * 0.95)
+        h = img.height
+        
+        # Find Anchors (TRACES format: 1.3, 1.5, etc.)
+        y_box_3 = find_anchor_y(ocr_data, ["1.3", "3.", "address", "operator"]) or int(h * 0.15)
+        y_box_5 = find_anchor_y(ocr_data, ["1.5", "5.", "activity", "activities"]) 
+        
+        # Fallback if "Activity" isn't found
+        if not y_box_5: y_box_5 = int(h * 0.50)
+
+        y_box_6 = find_anchor_y(ocr_data, ["1.6", "6.", "category"]) or int(h * 0.60)
+        y_footer = int(h * 0.95)
 
         # 2. Extract Zones
         # Header (Doc Num)
         header_text = surgical_crop(img, 0, y_box_3, split_vertical=False)
         
         # Columns (Operator vs Authority)
-        # Adjust y_start to skip the header row "Name and address..."
-        y_cols_start = y_box_3 + 60 
+        # Start slightly below the header line
+        y_cols_start = y_box_3 + 50 
+        
         operator_text = surgical_crop(img, y_cols_start, y_box_5, split_vertical=True, side="left")
         authority_text = surgical_crop(img, y_cols_start, y_box_5, split_vertical=True, side="right")
         
-        # Products (From Bottom of Page 1 OR Page 2)
+        # Products (Bottom of Page 1 OR Page 2)
         if file.type == "application/pdf" and len(images) > 1:
              products_text = pytesseract.image_to_string(prod_img, lang=LANGUAGES_CONFIG, config='--psm 6')
         else:
@@ -127,8 +145,8 @@ def parse_checkbox_products(text):
         l = line.strip()
         l_low = l.lower()
         
-        # Remove Page Numbers
         if "page" in l_low and "from" in l_low: continue
+        if "regulation" in l_low: continue
 
         # Keep Headers
         if l_low.startswith(categories):
@@ -138,11 +156,9 @@ def parse_checkbox_products(text):
         # Keep Checked Items
         is_checked = False
         if any(l.startswith(m) for m in checked_marks): is_checked = True
-        # If it says "Organic" and doesn't start with "O" (Empty)
         if "organic" in l_low and not l.startswith("O") and not l.startswith("0"): is_checked = True
         
         if is_checked:
-            # Clean
             clean = l
             for m in checked_marks: clean = clean.replace(m, "")
             active.append(clean.strip())
@@ -165,27 +181,29 @@ def validate_compliance(data):
     report = {"score": 0, "total": 8, "details": []}
     
     # 1. Document Identification
-    doc_num = re.search(r'0\d{4,}', data['header'])
+    doc_num = re.search(r'[A-Z]{2}-.*?-\d+', data['header'])
+    if not doc_num: doc_num = re.search(r'0\d{4,}', data['header'])
+    
     if doc_num:
         report["score"] += 1
         report["details"].append(f"✅ (1) Document ID Found: {doc_num.group(0)}")
     else:
         report["details"].append("❌ (1) Document ID Missing")
 
-    # 2. Entity Information (Operator)
+    # 2. Operator
     if len(data['operator']) > 10:
         report["score"] += 1
         report["details"].append("✅ (2) Operator Details Detected")
     else:
         report["details"].append("❌ (2) Operator Details Unclear")
 
-    # 3. Control Authority (The Annex II Check)
-    cb_code = re.search(r'[A-Z]{2}-[A-Z]{3,}-\d{3}', data['authority'])
+    # 3. Authority
+    cb_code = re.search(r'[A-Z]{2}-[A-Z]{3,}-\d{2,3}', data['authority']) or re.search(r'[A-Z]{2}-[A-Z]{3,}-\d{2,3}', data['full_text'])
     if cb_code:
         report["score"] += 1
         report["details"].append(f"✅ (2) Control Body Code: {cb_code.group(0)}")
     else:
-        report["details"].append("⚠️ (2) Control Body Code (e.g. TH-BIO-121) not found")
+        report["details"].append("⚠️ (2) Control Body Code not explicitly found in box")
 
     # 4. Activities
     if "activity" in data['full_text'].lower():
@@ -194,7 +212,7 @@ def validate_compliance(data):
     else:
         report["details"].append("⚠️ (3) Activities Section Missing")
 
-    # 5. Product Categories
+    # 5. Products
     active_prods = parse_checkbox_products(data['products'])
     if len(active_prods) > 0:
         report["score"] += 1
@@ -202,14 +220,14 @@ def validate_compliance(data):
     else:
         report["details"].append("❌ (4) No Active Products Detected")
 
-    # 7. Legal Statement
+    # 7. Legal
     if "2018/848" in data['full_text'] or "2021/1378" in data['full_text']:
         report["score"] += 1
         report["details"].append("✅ (7) EU Regulation Cited")
     else:
-        report["details"].append("❌ (7) Missing Legal Reference (2018/848)")
+        report["details"].append("❌ (7) Missing Legal Reference")
 
-    # 8. Authentication
+    # 8. Seal
     if "electronically signed" in data['full_text'].lower() or "traces" in data['full_text'].lower():
         report["score"] += 1
         report["details"].append("✅ (8) Electronic/TRACES Seal")
@@ -237,21 +255,19 @@ wallet = st.sidebar.text_input("Wallet Address")
 
 if wallet:
     st.title("🇪🇺 Organic Compliance Engine")
-    st.markdown("**Standard:** EU Regulation 2021/1378 | **Mode:** Spatial Analysis")
+    st.markdown("**Standard:** EU Regulation 2021/1378 | **Mode:** Spatial Analysis (Safe Crop)")
 
     uploaded_file = st.file_uploader("Upload TRACES Certificate", type=['png', 'jpg', 'pdf'])
 
     if uploaded_file:
-        with st.spinner('Extracting & Validating (Optimized)...'):
+        with st.spinner('Extracting & Validating...'):
             data = extract_full_data_spatial(uploaded_file)
             
             if data:
                 report, products = validate_compliance(data)
 
-                # --- RESULTS ---
+                # Results
                 st.markdown("### 📋 10-Point Compliance Check")
-                
-                # Score Banner
                 if report['score'] >= 7:
                     st.success(f"PASSING SCORE: {report['score']}/{report['total']}")
                 else:
@@ -262,8 +278,6 @@ if wallet:
                         st.write(line)
 
                 st.markdown("---")
-
-                # Extraction Visuals
                 c1, c2 = st.columns(2)
                 with c1:
                     st.subheader("🏭 Operator (Box 2)")
@@ -277,6 +291,5 @@ if wallet:
                     for p in products: st.markdown(f"- {p}")
                 else:
                     st.caption("No active products found.")
-
 else:
     st.warning("Please log in.")
