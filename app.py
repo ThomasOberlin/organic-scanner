@@ -13,7 +13,7 @@ LANGUAGES_CONFIG = 'eng+deu+fra+ita+spa+nld+por'
 IOTA_RPC_URL = "https://api.testnet.iota.cafe" 
 SIMULATION_MODE = True 
 
-# --- KEYWORDS & ANCHORS ---
+# --- KEYWORDS ---
 EXPIRY_KEYWORDS = [
     "valid until", "expiry date", "date of expiry", "validity", "expires",
     "certificate valid", "valid from", "valid to", 
@@ -32,23 +32,12 @@ STATUS_BAD_KEYWORDS = [
 # --- HELPER FUNCTIONS ---
 
 def preprocess_image(img):
-    """
-    The 'Reading Glasses' for the AI.
-    1. Converts to Greyscale (removes color noise)
-    2. Increases Contrast (makes text darker)
-    3. Sharpens the image
-    """
-    # 1. Grayscale
+    """High-Res 'Reading Glasses' for OCR"""
     img = ImageOps.grayscale(img)
-    
-    # 2. Increase Contrast
     enhancer = ImageEnhance.Contrast(img)
-    img = enhancer.enhance(2.0) # Double the contrast
-    
-    # 3. Increase Sharpness
+    img = enhancer.enhance(2.0)
     enhancer = ImageEnhance.Sharpness(img)
     img = enhancer.enhance(1.5)
-    
     return img
 
 def check_token_balance(address):
@@ -59,33 +48,25 @@ def extract_text(file):
     text = ""
     try:
         if file.type == "application/pdf":
-            # PDF: Render at 300 DPI (High Def) instead of default 200
             images = convert_from_bytes(file.read(), dpi=300)
             for img in images:
                 img = preprocess_image(img)
-                # --psm 3 is default, but --psm 6 assumes a single block of text
-                text += pytesseract.image_to_string(img, lang=LANGUAGES_CONFIG, config='--psm 3') + "\n"
+                # psm 4 = Assume a single column of text of variable sizes
+                text += pytesseract.image_to_string(img, lang=LANGUAGES_CONFIG, config='--psm 4') + "\n"
         else:
-            # IMAGES: Resize (Zoom) if it's too small
             img = Image.open(file)
-            
-            # If image width is small (< 2000px), double it for better OCR
             if img.width < 2000:
                 new_size = (img.width * 2, img.height * 2)
                 img = img.resize(new_size, Image.Resampling.LANCZOS)
-            
             img = preprocess_image(img)
-            text += pytesseract.image_to_string(img, lang=LANGUAGES_CONFIG, config='--psm 3')
-            
+            text += pytesseract.image_to_string(img, lang=LANGUAGES_CONFIG, config='--psm 4')
     except Exception as e:
         st.error(f"Error: {e}")
     return text
 
 def find_smart_date(text):
     candidates = []
-    # Regex for EU dates: DD.MM.YYYY or DD/MM/YYYY or YYYY-MM-DD
     date_pattern = r'(\d{1,2}[./-]\d{1,2}[./-]\d{2,4})|(\d{4}[./-]\d{1,2}[./-]\d{1,2})'
-    
     matches = re.findall(date_pattern, text)
     for match in matches:
         date_str = match[0] if match[0] else match[1]
@@ -95,9 +76,7 @@ def find_smart_date(text):
                 candidates.append(dt)
         except:
             continue
-
-    if not candidates: return None
-    return max(candidates)
+    return max(candidates) if candidates else None
 
 def check_fraud(text):
     text_lower = text.lower()
@@ -106,20 +85,69 @@ def check_fraud(text):
             return True, kw.upper()
     return False, None
 
-def extract_block(text, start_markers, end_markers):
+# --- NEW: CLEANING FUNCTIONS ---
+
+def clean_authority(text):
+    """Removes standard boilerplate to show only the name."""
+    # Common legal headers in EN/DE/FR
+    boilerplate = [
+        "name and address of the competent authority", 
+        "control authority or control body", 
+        "code number",
+        "kontrollstelle", "kontrollbehörde",
+        "autorité de contrôle"
+    ]
+    
     lines = text.split('\n')
-    capture = False
-    captured_lines = []
+    clean_lines = []
+    for line in lines:
+        # Only keep line if it DOESN'T contain the boilerplate
+        if not any(bp in line.lower() for bp in boilerplate):
+            if len(line) > 3: # Skip noise
+                clean_lines.append(line)
+    
+    return "\n".join(clean_lines).strip()
+
+def clean_products(text):
+    """Filters the massive product block to show only categories."""
+    lines = text.split('\n')
+    concise_list = []
+    
+    # Look for lines that start with a bullet, a letter, or have a checkmark
+    # EU Categories usually start with "a) Unprocessed...", "b) Livestock..."
+    valid_starts = ["a)", "b)", "c)", "d)", "e)", "f)", "g)", "h)", "-"]
+    keywords = ["organic production", "production method", "unprocessed", "processed", "livestock"]
     
     for line in lines:
-        line_lower = line.lower()
-        if capture and any(end in line_lower for end in end_markers): break
-        if capture:
-            if len(line.strip()) > 3: captured_lines.append(line.strip())
-        if not capture and any(start in line_lower for start in start_markers):
+        l = line.strip()
+        # If line starts with a category marker (a, b, c...) OR contains "Organic"
+        if any(l.lower().startswith(s) for s in valid_starts) or "organic" in l.lower():
+             # Filter out the long legal headers
+            if "regulation (eu)" not in l.lower() and "article" not in l.lower():
+                concise_list.append(l)
+                
+    return "\n".join(concise_list) if concise_list else "Check Full Text (Complex Format)"
+
+def extract_block_smart(text, start_marker, stop_markers):
+    lines = text.split('\n')
+    capture = False
+    captured = []
+    
+    for line in lines:
+        l_lower = line.lower()
+        # START
+        if any(s in l_lower for s in start_marker):
             capture = True
+            continue # Skip the header line itself
+        
+        # STOP
+        if capture and any(s in l_lower for s in stop_markers):
+            break
             
-    return "\n".join(captured_lines).strip() if captured_lines else "Not Detected"
+        if capture:
+            captured.append(line)
+            
+    return "\n".join(captured).strip()
 
 # --- APP UI ---
 
@@ -143,26 +171,31 @@ if has_access:
     uploaded_file = st.file_uploader("Upload Certificate", type=['png', 'jpg', 'pdf'])
 
     if uploaded_file:
-        with st.spinner('Enhancing Image & Scanning...'):
+        with st.spinner('Processing (High-Res Mode)...'):
             text = extract_text(uploaded_file)
         
         if text:
             expiry = find_smart_date(text)
             is_bad, bad_word = check_fraud(text)
             
-            # EXTRACT BLOCKS
-            doc_id = extract_block(text, ["document number", "nummer", "code"], ["operator", "unternehmer", "opérateur"])
-            operator_info = extract_block(text, ["1.3", "operator", "unternehmer", "name and address"], ["1.4", "authority", "activity", "tätigkeit"])
-            authority_info = extract_block(text, ["1.4", "control authority", "code number"], ["1.5", "activity", "tätigkeit"])
-            # Refined Product Search: Look for 1.6 OR 'Category'
-            product_info = extract_block(text, ["1.6", "category", "products", "erzeugnis"], ["part ii", "date", "validity", "datum"])
+            # --- NEW EXTRACTION LOGIC ---
+            # 1. Operator (Box 3): Starts after "Name and address"
+            op_raw = extract_block_smart(text, ["3. name", "3. name and address"], ["4. name", "4. name and address"])
+            
+            # 2. Authority (Box 4): Starts after "Competent authority"
+            auth_raw = extract_block_smart(text, ["4. name", "competent authority"], ["5. activity", "certification department"])
+            auth_clean = clean_authority(auth_raw)
 
-            # DISPLAY
+            # 3. Products (Box 6): Starts after "Category"
+            prod_raw = extract_block_smart(text, ["6. category", "category of products"], ["part ii", "date, place", "7. date"])
+            prod_clean = clean_products(prod_raw)
+
+            # DISPLAY DASHBOARD
             st.markdown("---")
             c1, c2, c3 = st.columns(3)
             with c1:
                 st.subheader("🚦 Compliance")
-                if is_bad: st.error(f"🚨 FRAUD ALERT: '{bad_word}'")
+                if is_bad: st.error(f"🚨 FRAUD: '{bad_word}'")
                 elif expiry and (expiry - datetime.now()).days < 0: st.error("❌ EXPIRED")
                 else: st.success("✅ Status: Active")
             
@@ -176,20 +209,26 @@ if has_access:
                 else: st.warning("Date not detected")
             
             with c3:
-                st.subheader("📄 Doc ID")
-                st.write(doc_id if len(doc_id) < 50 else "See details below")
+                st.subheader("📄 Extraction")
+                st.write("Automated Grid Analysis")
 
             st.markdown("---")
             col_left, col_right = st.columns(2)
+            
             with col_left:
                 st.markdown("### 🏭 Operator / Farm")
-                st.info(operator_info)
-                st.markdown("### 📦 Products")
-                st.text(product_info)
+                # Fallback: If smart block fails, try generic search
+                if len(op_raw) < 5: 
+                    st.info("Detected in raw text (See below)")
+                else:
+                    st.info(op_raw)
+                    
+                st.markdown("### 📦 Certified Products")
+                st.text(prod_clean)
             
             with col_right:
                 st.markdown("### ⚖️ Certifying Authority")
-                st.warning(authority_info)
+                st.warning(auth_clean)
                 
             with st.expander("🔍 View Full Scanned Text"):
                 st.text(text)
