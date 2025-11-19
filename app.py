@@ -6,115 +6,169 @@ from PIL import Image, ImageOps, ImageEnhance
 from datetime import datetime
 from dateutil import parser
 import re
-from difflib import SequenceMatcher
 
 # --- CONFIGURATION ---
 LANGUAGES_CONFIG = 'eng+deu+fra+ita+spa+nld+por'
 IOTA_RPC_URL = "https://api.testnet.iota.cafe" 
 SIMULATION_MODE = True 
 
-# --- CONSTANTS ---
-EXPIRY_KEYWORDS = [
-    "valid until", "expiry date", "date of expiry", "validity", "expires",
-    "certificate valid", "valid from", "valid to", "gültig bis", "ablaufdatum"
-]
-
-STATUS_BAD_KEYWORDS = [
-    "suspended", "withdrawn", "revoked", "cancelled", "invalid", "suspendu"
-]
-
-REQUIRED_LEGAL_TEXT = [
-    "regulation (eu) 2018/848", "organic production", "mandatory elements"
-]
-
-# --- IMAGE PROCESSING ---
+# --- IMAGE UTILS ---
 def preprocess_image(img):
-    """Enhances image to clear up the 'Grid' confusion"""
+    """Standard enhancement for OCR"""
     img = ImageOps.grayscale(img)
     enhancer = ImageEnhance.Contrast(img)
     img = enhancer.enhance(2.0)
-    enhancer = ImageEnhance.Sharpness(img)
-    img = enhancer.enhance(1.5)
     return img
 
-# --- CORE EXTRACTION LOGIC ---
-def extract_text_and_data(file):
-    full_text = ""
-    combined_data = {'conf': []}
+def split_image_layout(img):
+    """
+    VIRTUAL SCISSORS: Cuts the document into logical zones to prevent text mixing.
+    Returns: header_img, left_col_img, right_col_img, bottom_img
+    """
+    w, h = img.size
+    
+    # 1. Define Cut Points (Approximations based on EU Standard Layout)
+    # Header: Top 20% (Doc number, Title)
+    header_h = int(h * 0.20)
+    
+    # Columns: 20% down to 50% down (Operator / Authority Area)
+    cols_h_start = header_h
+    cols_h_end = int(h * 0.50)
+    
+    # Products: Bottom 50%
+    prod_h_start = cols_h_end
+    
+    # 2. Perform Crops
+    # Header
+    header_crop = img.crop((0, 0, w, header_h))
+    
+    # Split Columns (Left and Right halves of the middle section)
+    mid_crop = img.crop((0, cols_h_start, w, cols_h_end))
+    mid_w, mid_h = mid_crop.size
+    left_col = mid_crop.crop((0, 0, mid_w // 2, mid_h))
+    right_col = mid_crop.crop((mid_w // 2, 0, mid_w, mid_h))
+    
+    # Bottom (Products)
+    bottom_crop = img.crop((0, prod_h_start, w, h))
+    
+    return header_crop, left_col, right_col, bottom_crop
+
+# --- EXTRACTION LOGIC ---
+def ocr_zone(img, config='--psm 6'):
+    """Runs OCR on a specific image slice"""
+    img = preprocess_image(img)
+    return pytesseract.image_to_string(img, lang=LANGUAGES_CONFIG, config=config)
+
+def extract_document_data(file):
+    """
+    Orchestrates the split-scan process.
+    """
+    full_text_debug = ""
+    extracted_data = {
+        "header": "",
+        "col_1": "",
+        "col_2": "",
+        "products": "",
+        "ocr_data": None # For forensic check (simplified here)
+    }
+    
     try:
+        # Convert file to Image
         if file.type == "application/pdf":
-            # 300 DPI is critical for reading the small Box Numbers (1. 2. 3.)
             images = convert_from_bytes(file.read(), dpi=300)
-            for img in images:
-                img = preprocess_image(img)
-                # psm 6 assumes a single uniform block of text
-                full_text += pytesseract.image_to_string(img, lang=LANGUAGES_CONFIG, config='--psm 6') + "\n"
-                data = pytesseract.image_to_data(img, lang=LANGUAGES_CONFIG, output_type=Output.DICT)
-                combined_data['conf'].extend(data['conf'])
+            main_img = images[0] # Analyze first page for Operator/Authority
         else:
-            img = Image.open(file)
-            if img.width < 2000:
-                new_size = (img.width * 2, img.height * 2)
-                img = img.resize(new_size, Image.Resampling.LANCZOS)
-            img = preprocess_image(img)
-            full_text += pytesseract.image_to_string(img, lang=LANGUAGES_CONFIG, config='--psm 6')
-            data = pytesseract.image_to_data(img, lang=LANGUAGES_CONFIG, output_type=Output.DICT)
-            combined_data['conf'].extend(data['conf'])
+            main_img = Image.open(file)
+
+        # Enforce minimum size for splitting
+        if main_img.width < 2000:
+            new_size = (main_img.width * 2, main_img.height * 2)
+            main_img = main_img.resize(new_size, Image.Resampling.LANCZOS)
+
+        # SPLIT THE IMAGE
+        header_img, left_img, right_img, bottom_img = split_image_layout(main_img)
+        
+        # OCR EACH ZONE
+        extracted_data["header"] = ocr_zone(header_img)
+        extracted_data["col_1"] = ocr_zone(left_img)
+        extracted_data["col_2"] = ocr_zone(right_img)
+        extracted_data["products"] = ocr_zone(bottom_img, config='--psm 4') # psm 4 is good for tables/lists
+        
+        # Combine for date search
+        full_text_debug = extracted_data["header"] + "\n" + extracted_data["col_1"] + "\n" + extracted_data["col_2"] + "\n" + extracted_data["products"]
+        
     except Exception as e:
         st.error(f"Error: {e}")
-    return full_text, combined_data
+        
+    return extracted_data, full_text_debug
 
-# --- NEW: BOX PARSING ENGINE ---
-def extract_eu_box(text, box_number_start, box_number_end):
+# --- PARSING & CLEANING ---
+def identify_columns(col1_text, col2_text):
     """
-    Strictly cuts text between two Box Numbers (e.g., '4.' and '5.')
+    Determines which column is 'Operator' and which is 'Authority' 
+    by looking for keywords in the text of that specific column.
     """
-    # Regex looks for "4." followed by text, stopping at "5." or a backup keyword
-    pattern = fr"(?:{box_number_start}\.|{box_number_start})\s*(.*?)(?={box_number_end}\.|{box_number_end}\s|[A-Z][a-z]+:)"
+    # Default assumption
+    operator_text = col2_text
+    authority_text = col1_text
     
-    match = re.search(pattern, text, re.DOTALL | re.IGNORECASE)
-    if match:
-        content = match.group(1).strip()
-        # Clean up the Header Text inside the box
-        lines = content.split('\n')
-        clean_lines = [line for line in lines if len(line) > 3 and "name and address" not in line.lower()]
-        return "\n".join(clean_lines)
-    return None
+    # Smart Check
+    c1 = col1_text.lower()
+    c2 = col2_text.lower()
+    
+    # If Column 1 has "Operator" headers but Column 2 has "Authority" headers...
+    # Note: Box 3 is usually Authority in some layouts, Operator in others.
+    # We look for the CONTENT or Header hints.
+    
+    if "frujo" in c2 or "operator" in c2:
+        operator_text = col2_text
+        authority_text = col1_text
+    elif "frujo" in c1 or "operator" in c1:
+        operator_text = col1_text
+        authority_text = col2_text
+        
+    return operator_text, authority_text
 
-def clean_products_list(text):
-    """Filters the product section to remove legal noise."""
+def format_product_summary(text):
+    """
+    Turns raw product text into clean bullet points.
+    Removes legal boilerplate.
+    """
     lines = text.split('\n')
-    products = []
-    # Standard EU Categories
-    categories = ["a)", "b)", "c)", "d)", "e)", "f)", "g)", "h)", "-"]
+    summary_bullets = []
+    
+    # Patterns to Capture
+    # 1. Categories: "a) Unprocessed plants"
+    # 2. Checkbox Items: "[x] Organic production" (OCR sees this as various symbols)
     
     for line in lines:
-        l_lower = line.lower()
-        # Keep lines that start with a category OR look like a product name
-        if any(l_lower.startswith(cat) for cat in categories) or "organic" in l_lower:
-            if "regulation" not in l_lower and "production method" not in l_lower:
-                products.append(line.strip())
-    
-    return "\n".join(products) if products else "See Full Text"
-
-# --- ANALYSIS FUNCTIONS ---
-def analyze_anomalies(text, ocr_data):
-    issues = []
-    risk_score = 0
-    
-    # 1. Blur Check
-    confidences = [int(c) for c in ocr_data['conf'] if c != -1]
-    avg_conf = sum(confidences) / len(confidences) if confidences else 0
-    if avg_conf < 50:
-        issues.append(f"⚠️ Low Resolution Scan (Confidence: {int(avg_conf)}%)")
-        risk_score += 20
-
-    # 2. Box Structure Check
-    if "1." not in text or "3." not in text:
-        issues.append("🚨 Invalid Document Structure (Missing Box Numbers)")
-        risk_score += 40
-
-    return risk_score, issues
+        l = line.strip()
+        l_lower = l.lower()
+        
+        # Skip empty or legal noise
+        if len(l) < 5: continue
+        if "regulation" in l_lower or "production method" in l_lower or "part i" in l_lower: continue
+        
+        # Detection Logic
+        is_category = re.match(r'^[a-z]\)', l_lower) # Matches a), b), etc.
+        is_product_line = "organic" in l_lower and ("production" not in l_lower or "non-organic" in l_lower)
+        
+        # Formatting
+        if is_category:
+            # Bold the category
+            clean_cat = l.replace(")", "").strip()
+            summary_bullets.append(f"**{clean_cat}**")
+        elif is_product_line:
+            # Clean up checkbox noise
+            clean_prod = l.replace("O ", "").replace("0 ", "").replace("[]", "").replace("_", "").strip()
+            # Only add if it looks meaningful
+            if len(clean_prod) > 10:
+                summary_bullets.append(f"* {clean_prod}")
+        elif l[0].isupper() and len(l) < 50: 
+            # Capture short capitalized lines (often specific product names)
+            summary_bullets.append(f"* {l}")
+            
+    return summary_bullets
 
 def find_smart_date(text):
     candidates = []
@@ -130,9 +184,13 @@ def find_smart_date(text):
 
 def check_fraud(text):
     text_lower = text.lower()
-    for kw in STATUS_BAD_KEYWORDS:
+    bad_keywords = ["suspended", "withdrawn", "revoked", "cancelled", "invalid"]
+    for kw in bad_keywords:
         if kw in text_lower: return True, kw.upper()
     return False, None
+
+def check_token_balance(address):
+    return address.startswith("0x") if SIMULATION_MODE else False
 
 # --- APP UI ---
 st.set_page_config(page_title="EU Organic Scanner", layout="wide")
@@ -152,37 +210,22 @@ if has_access:
     uploaded_file = st.file_uploader("Upload Certificate", type=['png', 'jpg', 'pdf'])
 
     if uploaded_file:
-        with st.spinner('Executing Strict Box Parsing...'):
-            text, ocr_data = extract_text_and_data(uploaded_file)
+        with st.spinner('Splitting Document Columns & Analyzing...'):
+            data_map, full_text = extract_document_data(uploaded_file)
         
-        if text:
-            risk_score, risk_issues = analyze_anomalies(text, ocr_data)
-            expiry = find_smart_date(text)
-            is_bad, bad_word = check_fraud(text)
+        if full_text:
+            # 1. Intelligence
+            expiry = find_smart_date(full_text)
+            is_bad, bad_word = check_fraud(full_text)
             
-            # --- STRICT BOX EXTRACTION ---
-            # Box 3: Authority (Between "3." and "4.")
-            authority_info = extract_eu_box(text, "3", "4")
+            # 2. Identify Columns
+            op_text, auth_text = identify_columns(data_map["col_1"], data_map["col_2"])
             
-            # Box 4: Operator (Between "4." and "5.")
-            operator_info = extract_eu_box(text, "4", "5")
-            
-            # Box 9: Group Members (If applicable)
-            group_members = extract_eu_box(text, "9", "Part II")
-            
-            # Products (Starts at Box 6, cleans up noise)
-            product_raw = extract_eu_box(text, "6", "Part II")
-            if not product_raw: product_raw = extract_eu_box(text, "6", "Date") # Backup stop
-            product_clean = clean_products_list(product_raw) if product_raw else "Not Detected"
+            # 3. Summarize Products
+            product_bullets = format_product_summary(data_map["products"])
 
             # --- DASHBOARD ---
             st.markdown("---")
-            if risk_score > 0:
-                st.warning(f"🛡️ Anomalies Detected (Risk: {risk_score})")
-                for i in risk_issues: st.caption(f"- {i}")
-            else:
-                st.success("🛡️ Forensic Scan: Clean")
-
             c1, c2, c3 = st.columns(3)
             with c1:
                 if is_bad: st.error(f"🚨 FRAUD: {bad_word}")
@@ -192,33 +235,36 @@ if has_access:
             with c2:
                 if expiry: st.metric("Expiration", expiry.strftime("%Y-%m-%d"))
                 else: st.warning("Date Not Found")
-                
+            
             with c3:
-                st.metric("Parsing Mode", "EU Box Standard")
+                st.metric("Parsing Mode", "Column Split")
 
             st.markdown("---")
             
             col1, col2 = st.columns(2)
             
             with col1:
-                st.subheader("🏭 Operator (Box 4)")
-                if operator_info: st.info(operator_info)
-                else: st.warning("Could not detect Box 4")
-                
-                if group_members:
-                    st.subheader("📍 Additional Locations (Box 9)")
-                    st.info(group_members)
+                st.subheader("🏭 Operator")
+                # Display just the text, cleaning up the header numbers slightly
+                clean_op = op_text.replace("4.", "").replace("Name and address", "").strip()
+                st.info(clean_op)
 
             with col2:
-                st.subheader("⚖️ Authority (Box 3)")
-                if authority_info: st.success(authority_info)
-                else: st.warning("Could not detect Box 3")
+                st.subheader("⚖️ Authority")
+                clean_auth = auth_text.replace("3.", "").replace("Name and address", "").strip()
+                st.warning(clean_auth)
 
-            st.subheader("📦 Certified Products (Box 6)")
-            st.text(product_clean)
+            st.markdown("### 📦 Certified Products (Summary)")
             
-            with st.expander("View Raw Text"):
-                st.text(text)
+            if product_bullets:
+                with st.container(border=True):
+                    for bullet in product_bullets:
+                        st.markdown(bullet)
+            else:
+                st.caption("No product categories detected clearly.")
+                
+            with st.expander("View Raw OCR Text"):
+                st.text(full_text)
 else:
     st.title("🔒 Restricted Access")
     st.warning("Please login via the Sidebar.")
