@@ -8,19 +8,15 @@ from dateutil import parser
 import re
 
 # --- CONFIGURATION ---
+# This loads ALL 7 languages into the brain at once
 LANGUAGES_CONFIG = 'eng+deu+fra+ita+spa+nld+por'
 
-# --- IOTA BLOCKCHAIN CONFIGURATION ---
-# This is the IOTA Rebased Testnet Node
+# --- IOTA CONFIG ---
 IOTA_RPC_URL = "https://api.testnet.iota.cafe" 
-
-# THIS IS THE KEY VARIABLE:
-# Once you create your own token, you will paste its ID here.
-# For now, we use a "Simulation Mode" so you can see the app work.
 SIMULATION_MODE = True 
-YOUR_TOKEN_ID = "0x123...PasteYourRealTokenIDHere"
+YOUR_TOKEN_ID = "0x123_PLACEHOLDER"
 
-# --- KEYWORDS (Scanner Logic) ---
+# --- KEYWORDS ---
 EXPIRY_KEYWORDS = [
     "valid until", "expiry date", "date of expiry", "validity", "expires",
     "gültig bis", "ablaufdatum", "valable jusqu'au", "date d'expiration",
@@ -42,31 +38,11 @@ OPERATOR_KEYWORDS = [
     "operador", "produtor", "fabricante"
 ]
 
-# --- BLOCKCHAIN FUNCTIONS ---
+# --- FUNCTIONS ---
 
 def check_token_balance(address):
-    """Checks the IOTA blockchain for your token."""
-    if SIMULATION_MODE:
-        # In simulation, any address starting with '0x' is accepted
-        return address.startswith("0x")
-    
-    # REAL LOGIC (For later)
-    payload = {
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": "suix_getBalance", # IOTA Rebased uses the Sui API structure
-        "params": [address, YOUR_TOKEN_ID]
-    }
-    try:
-        response = requests.post(IOTA_RPC_URL, json=payload, timeout=5).json()
-        if "result" in response:
-            balance = int(response["result"].get("totalBalance", 0))
-            return balance > 0
-    except:
-        return False
-    return False
-
-# --- SCANNER FUNCTIONS ---
+    if SIMULATION_MODE: return address.startswith("0x")
+    return False # Placeholder for real logic
 
 def extract_text(file):
     text = ""
@@ -74,6 +50,7 @@ def extract_text(file):
         if file.type == "application/pdf":
             images = convert_from_bytes(file.read())
             for img in images:
+                # We force Tesseract to look for all languages
                 text += pytesseract.image_to_string(img, lang=LANGUAGES_CONFIG) + "\n"
         else:
             img = Image.open(file)
@@ -113,35 +90,33 @@ def extract_farm_name(text):
                 return "\n".join(lines[i+1 : i+3]).strip()
     return "Not detected automatically"
 
-# --- APP INTERFACE ---
+# --- APP UI ---
 
 st.set_page_config(page_title="EU Organic Scanner", layout="wide")
 
-# 1. THE SIDEBAR (Login)
+# SIDEBAR
 st.sidebar.title("🔐 Client Login")
-st.sidebar.markdown("Access to this scanner is restricted to **Utility Token Holders**.")
-
-wallet_address = st.sidebar.text_input("Enter IOTA Wallet Address", placeholder="0x...")
-check_button = st.sidebar.button("Verify Access")
-
+wallet_address = st.sidebar.text_input("Wallet Address", placeholder="0x...")
 has_access = False
 
 if wallet_address:
     if check_token_balance(wallet_address):
-        st.sidebar.success("✅ Token Verified")
+        st.sidebar.success("✅ Access Granted")
         has_access = True
     else:
-        st.sidebar.error("❌ Access Denied: No Token Found")
+        st.sidebar.error("❌ Access Denied")
 
-# 2. THE MAIN APP (Guarded)
+# MAIN SCREEN
 if has_access:
-    st.title("🌱 Organic Certificate Scanner (Premium)")
-    st.markdown("**Status:** Active | **License:** Valid Utility Token")
+    st.title("🌱 Organic Certificate Scanner")
+    
+    # --- EVIDENCE OF LANGUAGES ---
+    st.info("✅ **Active Languages:** English, German, French, Italian, Spanish, Dutch, Portuguese")
     
     uploaded_file = st.file_uploader("Upload Certificate", type=['png', 'jpg', 'pdf'])
 
     if uploaded_file:
-        with st.spinner('Processing...'):
+        with st.spinner('Scanning with Multi-Language OCR Engine...'):
             text = extract_text(uploaded_file)
         
         if text:
@@ -152,37 +127,23 @@ if has_access:
             c1, c2 = st.columns(2)
             with c1:
                 st.subheader("Risk Analysis")
-                if is_bad:
-                    st.error(f"🚨 CRITICAL: Found '{bad_word}'")
-                else:
-                    st.success("✅ Status: Clear")
+                if is_bad: st.error(f"🚨 CRITICAL: Found '{bad_word}'")
+                else: st.success("✅ Status: Clear")
                 
                 if expiry:
                     days = (expiry - datetime.now()).days
                     st.metric("Expiration", expiry.strftime("%Y-%m-%d"), f"{days} days")
                     if days < 0: st.error("EXPIRED")
                     elif days < 60: st.error("⚠️ Expires < 60 days")
-                    elif days < 90: st.warning("⚠️ Expires < 90 days")
-                    else: st.success("Valid")
-                else:
-                    st.warning("Date not found.")
+                else: st.warning("Date not found.")
             
             with c2:
                 st.subheader("Farm Details")
                 st.info(farm)
-                with st.expander("Raw Text"):
-                    st.text(text)
+                
+                # DEBUG EXPANDER
+                with st.expander("🔍 View Raw Scanned Text"):
+                    st.write(text)
 else:
-    # BLOCKED STATE
-    
     st.title("🔒 Restricted Access")
-    st.markdown("""
-    ### Welcome to the Organic Compliance Platform.
-    
-    To use this tool, you must hold the **Organic Utility Token** in your IOTA wallet.
-    
-    **How to Login:**
-    1. Open the Sidebar (left).
-    2. Enter your Wallet Address.
-    3. Click Verify.
-    """)
+    st.warning("Please login via the Sidebar.")
