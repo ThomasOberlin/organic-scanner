@@ -11,11 +11,10 @@ import re
 SIMULATION_MODE = True 
 
 # --- INITIALIZE PADDLE OCR (The "Brain") ---
-# We cache this so it doesn't reload on every click
 @st.cache_resource
 def get_ocr_engine():
-    # lang='en' covers most Latin-based European languages well
-    return PaddleOCR(use_angle_cls=True, lang='en', show_log=False)
+    # REMOVED 'show_log=False' to fix the crash
+    return PaddleOCR(use_angle_cls=True, lang='en')
 
 ocr_engine = get_ocr_engine()
 
@@ -23,7 +22,6 @@ ocr_engine = get_ocr_engine()
 def preprocess_image(img):
     """
     Standard enhancement, but less aggressive than Tesseract needs.
-    Paddle is smarter, so we don't need to binary-threshold as hard.
     """
     img = ImageOps.grayscale(img)
     enhancer = ImageEnhance.Contrast(img)
@@ -44,7 +42,6 @@ def find_anchor_y(ocr_data, keywords):
         box, (text, conf) = line
         text = text.lower()
         if any(kw in text for kw in keywords):
-            # Return the top Y coordinate (box[0][1])
             return int(box[0][1])
     return None
 
@@ -56,7 +53,6 @@ def surgical_crop(img, y_start, y_end, split_vertical=False, side="left"):
     if y_start is None: y_start = 0
     if y_end is None: y_end = h
     
-    # Crash protection
     if y_end <= y_start: y_end = min(y_start + 500, h)
 
     if split_vertical:
@@ -67,11 +63,9 @@ def surgical_crop(img, y_start, y_end, split_vertical=False, side="left"):
         
     try:
         crop = img.crop((x_start, y_start, x_end, y_end))
-        # Run Paddle on this crop
         crop_np = pil_to_numpy(crop)
         result = ocr_engine.ocr(crop_np, cls=True)
         
-        # Flatten results into a single string
         full_text = ""
         if result and result[0]:
             for line in result[0]:
@@ -86,7 +80,6 @@ def extract_full_data_paddle(file):
     try:
         # Convert PDF/Image
         if file.type == "application/pdf":
-            # Memory Safe: Pages 1-2
             images = convert_from_bytes(file.read(), dpi=200, first_page=1, last_page=2)
             img = preprocess_image(images[0])
             prod_img = preprocess_image(images[1]) if len(images) > 1 else img
@@ -100,17 +93,15 @@ def extract_full_data_paddle(file):
         img_np = pil_to_numpy(img)
         raw_results = ocr_engine.ocr(img_np, cls=True)
         
-        # Flatten for simple text searching
         flat_text = ""
+        ocr_list = []
         if raw_results and raw_results[0]:
-             ocr_list = raw_results[0] # This is the list of boxes
+             ocr_list = raw_results[0]
              for line in ocr_list: flat_text += line[1][0] + "\n"
-        else:
-             ocr_list = []
 
         h = img.height
         
-        # 2. Find Anchors (Using Paddle Data Structure)
+        # 2. Find Anchors
         y_box_3 = find_anchor_y(ocr_list, ["1.3", "3.", "address", "operator"]) or int(h * 0.15)
         y_box_5 = find_anchor_y(ocr_list, ["1.5", "5.", "activity"]) 
         if not y_box_5: y_box_5 = int(h * 0.50)
@@ -119,18 +110,14 @@ def extract_full_data_paddle(file):
         y_footer = int(h * 0.95)
 
         # 3. Extract Zones
-        # Header
         header_text = surgical_crop(img, 0, y_box_3, split_vertical=False)
-        
-        # Columns
         y_cols_start = y_box_3 + 50
         operator_text = surgical_crop(img, y_cols_start, y_box_5, split_vertical=True, side="left")
         authority_text = surgical_crop(img, y_cols_start, y_box_5, split_vertical=True, side="right")
         
-        # Products (Scan Page 2 via Paddle)
+        # Products (Page 2 if avail)
         products_text = ""
         if file.type == "application/pdf" and 'images' in locals() and len(images) > 1:
-            # Scan Page 2 full
             p2_np = pil_to_numpy(prod_img)
             p2_res = ocr_engine.ocr(p2_np, cls=True)
             if p2_res and p2_res[0]:
@@ -150,11 +137,10 @@ def extract_full_data_paddle(file):
         st.error(f"Processing Error: {e}")
         return None
 
-# --- PARSING & VALIDATION (Same as before) ---
+# --- PARSING ---
 def parse_checkbox_products(text):
     lines = text.split('\n')
     active = []
-    # Paddle is good at checkmarks, often reads them as 'x' or 'v'
     checked_marks = ['X', 'x', 'V', '8', '☑', '[x]', 'v']
     categories = ("a)", "b)", "c)", "d)", "e)", "f)", "g)", "h)", "-")
     
@@ -193,7 +179,6 @@ def validate_compliance(data):
     
     doc_num = re.search(r'[A-Z]{2}-.*?-\d+', data['header'])
     if not doc_num: doc_num = re.search(r'0\d{4,}', data['header'])
-    
     if doc_num:
         report["score"] += 1
         report["details"].append(f"✅ (1) Document ID: {doc_num.group(0)}")
