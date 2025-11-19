@@ -13,15 +13,15 @@ SIMULATION_MODE = True
 # --- INITIALIZE PADDLE OCR (The "Brain") ---
 @st.cache_resource
 def get_ocr_engine():
-    # REMOVED 'show_log=False' to fix the crash
-    return PaddleOCR(use_angle_cls=True, lang='en')
+    # We enable the angle classifier HERE, so we don't need to ask for it later
+    return PaddleOCR(use_angle_cls=True, lang='en', show_log=False)
 
 ocr_engine = get_ocr_engine()
 
 # --- IMAGE PROCESSING ---
 def preprocess_image(img):
     """
-    Standard enhancement, but less aggressive than Tesseract needs.
+    Standard enhancement for OCR.
     """
     img = ImageOps.grayscale(img)
     enhancer = ImageEnhance.Contrast(img)
@@ -37,7 +37,7 @@ def find_anchor_y(ocr_data, keywords):
     """
     Finds the Y-coordinate of a keyword using Paddle's result format.
     """
-    # Paddle result format: [[[[x1,y1],[x2,y2]...], ("text", conf)]]
+    # Paddle format: [ [ [ [x1,y1]..], ("text", conf) ] ... ]
     for line in ocr_data:
         box, (text, conf) = line
         text = text.lower()
@@ -64,7 +64,8 @@ def surgical_crop(img, y_start, y_end, split_vertical=False, side="left"):
     try:
         crop = img.crop((x_start, y_start, x_end, y_end))
         crop_np = pil_to_numpy(crop)
-        result = ocr_engine.ocr(crop_np, cls=True)
+        # FIX: Removed cls=True here
+        result = ocr_engine.ocr(crop_np)
         
         full_text = ""
         if result and result[0]:
@@ -91,7 +92,8 @@ def extract_full_data_paddle(file):
 
         # 1. Get Landmarks (Full Page Scan)
         img_np = pil_to_numpy(img)
-        raw_results = ocr_engine.ocr(img_np, cls=True)
+        # FIX: Removed cls=True here
+        raw_results = ocr_engine.ocr(img_np)
         
         flat_text = ""
         ocr_list = []
@@ -119,7 +121,8 @@ def extract_full_data_paddle(file):
         products_text = ""
         if file.type == "application/pdf" and 'images' in locals() and len(images) > 1:
             p2_np = pil_to_numpy(prod_img)
-            p2_res = ocr_engine.ocr(p2_np, cls=True)
+            # FIX: Removed cls=True here
+            p2_res = ocr_engine.ocr(p2_np)
             if p2_res and p2_res[0]:
                 for line in p2_res[0]: products_text += line[1][0] + "\n"
         else:
