@@ -13,8 +13,8 @@ SIMULATION_MODE = True
 # --- INITIALIZE PADDLE OCR ---
 @st.cache_resource
 def get_ocr_engine():
-    # FIXED: Removed 'use_gpu=False' which was causing the crash
-    return PaddleOCR(use_angle_cls=True, lang='en')
+    # Clean initialization for PaddleOCR v2.7+
+    return PaddleOCR(use_angle_cls=True, lang='en', use_gpu=False, show_log=False)
 
 ocr_engine = get_ocr_engine()
 
@@ -31,11 +31,17 @@ def pil_to_numpy(img):
 # --- SPATIAL EXTRACTION ---
 def find_anchor_y(ocr_data, keywords):
     # Paddle format: [ [ [ [x1,y1]..], ("text", conf) ] ... ]
+    # We iterate through the results to find the keyword
+    if not ocr_data: return None
+    
     for line in ocr_data:
-        box, (text, conf) = line
-        text = text.lower()
+        # line structure: [ [[x,y], [x,y]...], ("text", 0.99) ]
+        box = line[0]
+        text_obj = line[1]
+        text = text_obj[0].lower()
+        
         if any(kw in text for kw in keywords):
-            return int(box[0][1])
+            return int(box[0][1]) # Return Y coordinate of top-left corner
     return None
 
 def surgical_crop(img, y_start, y_end, split_vertical=False, side="left"):
@@ -43,6 +49,7 @@ def surgical_crop(img, y_start, y_end, split_vertical=False, side="left"):
     if y_start is None: y_start = 0
     if y_end is None: y_end = h
     
+    # Safety
     if y_end <= y_start: y_end = min(y_start + 500, h)
 
     if split_vertical:
@@ -55,8 +62,8 @@ def surgical_crop(img, y_start, y_end, split_vertical=False, side="left"):
         crop = img.crop((x_start, y_start, x_end, y_end))
         crop_np = pil_to_numpy(crop)
         
-        # FIXED: Removed 'cls=True' to prevent argument errors
-        result = ocr_engine.ocr(crop_np)
+        # OCR the cropped area
+        result = ocr_engine.ocr(crop_np, cls=False)
         
         full_text = ""
         if result and result[0]:
@@ -84,12 +91,12 @@ def extract_full_data_paddle(file):
 
         # 1. Get Landmarks (Full Page Scan)
         img_np = pil_to_numpy(img)
-        
-        # FIXED: Removed 'cls=True'
-        raw_results = ocr_engine.ocr(img_np)
+        raw_results = ocr_engine.ocr(img_np, cls=True)
         
         flat_text = ""
         ocr_list = []
+        
+        # Paddle returns None if no text found, or a list of lists
         if raw_results and raw_results[0]:
              ocr_list = raw_results[0]
              for line in ocr_list: flat_text += line[1][0] + "\n"
@@ -114,8 +121,7 @@ def extract_full_data_paddle(file):
         products_text = ""
         if file.type == "application/pdf" and 'images' in locals() and len(images) > 1:
             p2_np = pil_to_numpy(prod_img)
-            # FIXED: Removed 'cls=True'
-            p2_res = ocr_engine.ocr(p2_np)
+            p2_res = ocr_engine.ocr(p2_np, cls=False)
             if p2_res and p2_res[0]:
                 for line in p2_res[0]: products_text += line[1][0] + "\n"
         else:
