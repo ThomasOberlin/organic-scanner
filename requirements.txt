@@ -1,6 +1,8 @@
 streamlit
-pytesseract
 pdf2image
 python-dateutil
 pillow
-requests
+numpy
+opencv-python-headless
+paddlepaddle
+paddleocr
