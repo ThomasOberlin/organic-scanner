@@ -47,7 +47,7 @@ def extract_text_and_data(file):
             images = convert_from_bytes(file.read(), dpi=300)
             for img in images:
                 img = preprocess_image(img)
-                # psm 6 assumes a single uniform block of text, often better for forms than psm 3
+                # psm 6 assumes a single uniform block of text
                 full_text += pytesseract.image_to_string(img, lang=LANGUAGES_CONFIG, config='--psm 6') + "\n"
                 data = pytesseract.image_to_data(img, lang=LANGUAGES_CONFIG, output_type=Output.DICT)
                 combined_data['conf'].extend(data['conf'])
@@ -70,15 +70,12 @@ def extract_eu_box(text, box_number_start, box_number_end):
     Strictly cuts text between two Box Numbers (e.g., '4.' and '5.')
     """
     # Regex looks for "4." followed by text, stopping at "5." or a backup keyword
-    # We use DOTALL so it captures newlines
-    
-    # Flexible pattern: Handles "4. Name" or "4 Name" or "4.Name"
     pattern = fr"(?:{box_number_start}\.|{box_number_start})\s*(.*?)(?={box_number_end}\.|{box_number_end}\s|[A-Z][a-z]+:)"
     
     match = re.search(pattern, text, re.DOTALL | re.IGNORECASE)
     if match:
         content = match.group(1).strip()
-        # Clean up the Header Text inside the box (e.g., remove "Name and address...")
+        # Clean up the Header Text inside the box
         lines = content.split('\n')
         clean_lines = [line for line in lines if len(line) > 3 and "name and address" not in line.lower()]
         return "\n".join(clean_lines)
@@ -95,7 +92,6 @@ def clean_products_list(text):
         l_lower = line.lower()
         # Keep lines that start with a category OR look like a product name
         if any(l_lower.startswith(cat) for cat in categories) or "organic" in l_lower:
-            # Filter out legal headers
             if "regulation" not in l_lower and "production method" not in l_lower:
                 products.append(line.strip())
     
@@ -113,8 +109,7 @@ def analyze_anomalies(text, ocr_data):
         issues.append(f"⚠️ Low Resolution Scan (Confidence: {int(avg_conf)}%)")
         risk_score += 20
 
-    # 2. Box Structure Check (The "DNA" Test)
-    # Real EU certs MUST have Box 1, 3, and 4.
+    # 2. Box Structure Check
     if "1." not in text or "3." not in text:
         issues.append("🚨 Invalid Document Structure (Missing Box Numbers)")
         risk_score += 40
@@ -146,7 +141,6 @@ st.sidebar.title("🔐 Client Login")
 wallet_address = st.sidebar.text_input("Wallet Address", placeholder="0x...")
 has_access = False
 
-# SIMULATION LOGIN
 if wallet_address and wallet_address.startswith("0x"):
     st.sidebar.success("✅ Access Granted")
     has_access = True
@@ -177,4 +171,54 @@ if has_access:
             group_members = extract_eu_box(text, "9", "Part II")
             
             # Products (Starts at Box 6, cleans up noise)
-            product_raw = extract_eu_box(text, "
+            product_raw = extract_eu_box(text, "6", "Part II")
+            if not product_raw: product_raw = extract_eu_box(text, "6", "Date") # Backup stop
+            product_clean = clean_products_list(product_raw) if product_raw else "Not Detected"
+
+            # --- DASHBOARD ---
+            st.markdown("---")
+            if risk_score > 0:
+                st.warning(f"🛡️ Anomalies Detected (Risk: {risk_score})")
+                for i in risk_issues: st.caption(f"- {i}")
+            else:
+                st.success("🛡️ Forensic Scan: Clean")
+
+            c1, c2, c3 = st.columns(3)
+            with c1:
+                if is_bad: st.error(f"🚨 FRAUD: {bad_word}")
+                elif expiry and (expiry - datetime.now()).days < 0: st.error("❌ EXPIRED")
+                else: st.success("✅ Status: Active")
+            
+            with c2:
+                if expiry: st.metric("Expiration", expiry.strftime("%Y-%m-%d"))
+                else: st.warning("Date Not Found")
+                
+            with c3:
+                st.metric("Parsing Mode", "EU Box Standard")
+
+            st.markdown("---")
+            
+            col1, col2 = st.columns(2)
+            
+            with col1:
+                st.subheader("🏭 Operator (Box 4)")
+                if operator_info: st.info(operator_info)
+                else: st.warning("Could not detect Box 4")
+                
+                if group_members:
+                    st.subheader("📍 Additional Locations (Box 9)")
+                    st.info(group_members)
+
+            with col2:
+                st.subheader("⚖️ Authority (Box 3)")
+                if authority_info: st.success(authority_info)
+                else: st.warning("Could not detect Box 3")
+
+            st.subheader("📦 Certified Products (Box 6)")
+            st.text(product_clean)
+            
+            with st.expander("View Raw Text"):
+                st.text(text)
+else:
+    st.title("🔒 Restricted Access")
+    st.warning("Please login via the Sidebar.")
