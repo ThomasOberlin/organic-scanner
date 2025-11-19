@@ -6,7 +6,6 @@ from PIL import Image, ImageOps, ImageEnhance
 from datetime import datetime
 from dateutil import parser
 import re
-from difflib import SequenceMatcher
 
 # --- CONFIGURATION ---
 LANGUAGES_CONFIG = 'eng+deu+fra+ita+spa+nld+por'
@@ -29,18 +28,32 @@ def preprocess_image(img):
 # --- SPATIAL EXTRACTION ENGINE ---
 def find_anchor_y(ocr_data, keywords):
     """Finds the vertical position (Y) of a keyword."""
+    if 'text' not in ocr_data: return None
     n_boxes = len(ocr_data['text'])
+    
     for i in range(n_boxes):
+        # Check if text matches any keyword
+        # We use strict string matching to avoid false positives on short words
         if any(kw in ocr_data['text'][i].lower() for kw in keywords):
-            if int(ocr_data['conf'][i]) > 50:
+            # Ensure reasonable confidence
+            if int(ocr_data['conf'][i]) > 40:
                 return ocr_data['top'][i]
     return None
 
 def surgical_crop(img, y_start, y_end, split_vertical=False, side="left"):
-    """Cuts specific zones of the image."""
+    """
+    Cuts specific zones of the image with CRASH PROTECTION.
+    """
     w, h = img.size
+    
+    # SAFETY CHECK 1: Ensure coordinates exist
     if y_start is None: y_start = 0
     if y_end is None: y_end = h
+    
+    # SAFETY CHECK 2: Prevent "Lower < Upper" crash
+    # If the bottom line is above the top line, force a default height of 400px
+    if y_end <= y_start:
+        y_end = min(y_start + 400, h)
     
     # Crop X-axis (Left/Right/Full)
     if split_vertical:
@@ -49,10 +62,15 @@ def surgical_crop(img, y_start, y_end, split_vertical=False, side="left"):
     else:
         x_start, x_end = 0, w
         
-    crop = img.crop((x_start, y_start, x_end, y_end))
-    
-    # psm 6 = Assume a single uniform block of text
-    return pytesseract.image_to_string(crop, lang=LANGUAGES_CONFIG, config='--psm 6')
+    # Final Boundary Check
+    if x_start >= x_end or y_start >= y_end:
+        return "Crop Error: Invalid Coordinates"
+
+    try:
+        crop = img.crop((x_start, y_start, x_end, y_end))
+        return pytesseract.image_to_string(crop, lang=LANGUAGES_CONFIG, config='--psm 6')
+    except Exception as e:
+        return f"Crop Failed: {str(e)}"
 
 def extract_full_data_spatial(file):
     """
@@ -64,24 +82,37 @@ def extract_full_data_spatial(file):
     try:
         # Convert to Image
         if file.type == "application/pdf":
-            images = convert_from_bytes(file.read(), dpi=300)
+            # MEMORY SAFE: Pages 1-2 only
+            images = convert_from_bytes(file.read(), dpi=300, first_page=1, last_page=2)
             img = preprocess_image(images[0])
+            prod_img = preprocess_image(images[1]) if len(images) > 1 else img
         else:
             img = Image.open(file)
             if img.width < 2000:
                 img = img.resize((img.width * 2, img.height * 2))
             img = preprocess_image(img)
+            prod_img = img
 
-        # 1. Get Landmarks
+        # 1. Get Landmarks from Page 1
         ocr_data = pytesseract.image_to_data(img, output_type=Output.DICT)
         full_text = pytesseract.image_to_string(img)
         
-        # Find "Box 3" (Authority) and "Box 5" (Activity)
-        # We assume standard EU Layout vertical ordering
-        y_box_3 = find_anchor_y(ocr_data, ["3.", "address"]) or int(img.height * 0.15)
-        y_box_5 = find_anchor_y(ocr_data, ["5.", "activity"]) or int(img.height * 0.45)
-        y_box_6 = find_anchor_y(ocr_data, ["6.", "category"]) or int(img.height * 0.60)
-        y_footer = int(img.height * 0.90)
+        h = img.height
+        
+        # Find Anchors (Updated for TRACES numbering "1.3", "1.5")
+        # Box 3 (Operator/Authority Start): Look for "1.3", "3.", "Address" near top
+        y_box_3 = find_anchor_y(ocr_data, ["1.3", "3.", "address", "operator"]) or int(h * 0.15)
+        
+        # Box 5 (Activity - The Bottom Limit for Operator/Auth): Look for "1.5", "5.", "activity"
+        y_box_5 = find_anchor_y(ocr_data, ["1.5", "5.", "activity", "activities"]) 
+        
+        # Fallback: If Activity not found, assume it's halfway down
+        if not y_box_5: 
+            y_box_5 = int(h * 0.50)
+
+        # Box 6 (Products): Look for "1.6", "6.", "category"
+        y_box_6 = find_anchor_y(ocr_data, ["1.6", "6.", "category"]) or int(h * 0.60)
+        y_footer = int(h * 0.95)
 
         # 2. Extract Zones
         # Header (Doc Num)
@@ -90,11 +121,16 @@ def extract_full_data_spatial(file):
         # Columns (Operator vs Authority)
         # Adjust y_start to skip the header row "Name and address..."
         y_cols_start = y_box_3 + 60 
+        
+        # Safe Crop enforces y_cols_start < y_box_5 internally
         operator_text = surgical_crop(img, y_cols_start, y_box_5, split_vertical=True, side="left")
         authority_text = surgical_crop(img, y_cols_start, y_box_5, split_vertical=True, side="right")
         
-        # Products (Bottom)
-        products_text = surgical_crop(img, y_box_6, y_footer, split_vertical=False)
+        # Products (From Bottom of Page 1 OR Page 2)
+        if file.type == "application/pdf" and len(images) > 1:
+             products_text = pytesseract.image_to_string(prod_img, lang=LANGUAGES_CONFIG, config='--psm 6')
+        else:
+             products_text = surgical_crop(img, y_box_6, y_footer, split_vertical=False)
 
         return {
             "full_text": full_text,
@@ -120,19 +156,20 @@ def parse_checkbox_products(text):
         l = line.strip()
         l_low = l.lower()
         
-        # Keep Headers
+        if "page" in l_low and "from" in l_low: continue
+        if "regulation" in l_low: continue
+
+        # Headers
         if l_low.startswith(categories):
             active.append(l)
             continue
             
-        # Keep Checked Items
+        # Checked Items
         is_checked = False
         if any(l.startswith(m) for m in checked_marks): is_checked = True
-        # If it says "Organic" and doesn't start with "O" (Empty)
         if "organic" in l_low and not l.startswith("O") and not l.startswith("0"): is_checked = True
         
         if is_checked:
-            # Clean
             clean = l
             for m in checked_marks: clean = clean.replace(m, "")
             active.append(clean.strip())
@@ -150,34 +187,35 @@ def find_smart_date(text):
         except: continue
     return max(candidates) if candidates else None
 
-# --- 10-POINT COMPLIANCE ENGINE ---
+# --- COMPLIANCE ENGINE ---
 def validate_compliance(data):
     report = {"score": 0, "total": 8, "details": []}
     
     # 1. Document Identification
-    doc_num = re.search(r'0\d{4,}', data['header'])
+    # Regex updated to catch complex codes like EE-OKO-03...
+    doc_num = re.search(r'[A-Z]{2}-.*?-\d+', data['header'])
+    if not doc_num: doc_num = re.search(r'0\d{4,}', data['header'])
+    
     if doc_num:
         report["score"] += 1
         report["details"].append(f"✅ (1) Document ID Found: {doc_num.group(0)}")
     else:
         report["details"].append("❌ (1) Document ID Missing")
 
-    # 2. Entity Information (Operator)
+    # 2. Operator
     if len(data['operator']) > 10:
         report["score"] += 1
         report["details"].append("✅ (2) Operator Details Detected")
     else:
         report["details"].append("❌ (2) Operator Details Unclear")
 
-    # 3. Control Authority (The Annex II Check)
-    # We look for ANY code pattern like XX-BIO-XXX
-    cb_code = re.search(r'[A-Z]{2}-[A-Z]{3,}-\d{3}', data['authority'])
+    # 3. Authority
+    cb_code = re.search(r'[A-Z]{2}-[A-Z]{3,}-\d{2,3}', data['authority']) or re.search(r'[A-Z]{2}-[A-Z]{3,}-\d{2,3}', data['full_text'])
     if cb_code:
         report["score"] += 1
         report["details"].append(f"✅ (2) Control Body Code: {cb_code.group(0)}")
-        # Note: We are NOT failing if it's not in the database, per user request.
     else:
-        report["details"].append("⚠️ (2) Control Body Code (e.g. TH-BIO-121) not found")
+        report["details"].append("⚠️ (2) Control Body Code not explicitly found in box")
 
     # 4. Activities
     if "activity" in data['full_text'].lower():
@@ -186,7 +224,7 @@ def validate_compliance(data):
     else:
         report["details"].append("⚠️ (3) Activities Section Missing")
 
-    # 5. Product Categories
+    # 5. Products
     active_prods = parse_checkbox_products(data['products'])
     if len(active_prods) > 0:
         report["score"] += 1
@@ -194,14 +232,14 @@ def validate_compliance(data):
     else:
         report["details"].append("❌ (4) No Active Products Detected")
 
-    # 7. Legal Statement
+    # 7. Legal
     if "2018/848" in data['full_text'] or "2021/1378" in data['full_text']:
         report["score"] += 1
         report["details"].append("✅ (7) EU Regulation Cited")
     else:
-        report["details"].append("❌ (7) Missing Legal Reference (2018/848)")
+        report["details"].append("❌ (7) Missing Legal Reference")
 
-    # 8. Authentication
+    # 8. Seal
     if "electronically signed" in data['full_text'].lower() or "traces" in data['full_text'].lower():
         report["score"] += 1
         report["details"].append("✅ (8) Electronic/TRACES Seal")
@@ -229,7 +267,7 @@ wallet = st.sidebar.text_input("Wallet Address")
 
 if wallet:
     st.title("🇪🇺 Organic Compliance Engine")
-    st.markdown("**Standard:** EU Regulation 2021/1378 | **Mode:** Spatial Analysis")
+    st.markdown("**Standard:** EU Regulation 2021/1378 | **Mode:** Spatial Analysis (Safe Crop)")
 
     uploaded_file = st.file_uploader("Upload TRACES Certificate", type=['png', 'jpg', 'pdf'])
 
@@ -240,10 +278,7 @@ if wallet:
             if data:
                 report, products = validate_compliance(data)
 
-                # --- RESULTS ---
                 st.markdown("### 📋 10-Point Compliance Check")
-                
-                # Score Banner
                 if report['score'] >= 7:
                     st.success(f"PASSING SCORE: {report['score']}/{report['total']}")
                 else:
@@ -254,21 +289,18 @@ if wallet:
                         st.write(line)
 
                 st.markdown("---")
-
-                # Extraction Visuals
                 c1, c2 = st.columns(2)
                 with c1:
-                    st.subheader("🏭 Operator (Box 2)")
+                    st.subheader("🏭 Operator")
                     st.info(data['operator'])
                 with c2:
-                    st.subheader("⚖️ Authority (Box 3)")
+                    st.subheader("⚖️ Authority")
                     st.warning(data['authority'])
 
-                st.subheader("📦 Validated Products (Box 6)")
+                st.subheader("📦 Validated Products")
                 if products:
                     for p in products: st.markdown(f"- {p}")
                 else:
                     st.caption("No active products found.")
-
 else:
     st.warning("Please log in.")
