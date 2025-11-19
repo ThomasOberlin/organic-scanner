@@ -8,13 +8,20 @@ from dateutil import parser
 import re
 
 # --- CONFIGURATION ---
+# Force lightweight mobile models to prevent timeout/memory crash
+OCR_VERSION = 'PP-OCRv4' 
 SIMULATION_MODE = True 
 
-# --- INITIALIZE PADDLE OCR ---
+# --- INITIALIZE PADDLE OCR (Lightweight) ---
 @st.cache_resource
 def get_ocr_engine():
-    # FIXED: Removed 'show_log=False' which was causing the crash
-    return PaddleOCR(use_angle_cls=True, lang='en')
+    # We explicitly ask for the Mobile version to save RAM and Time
+    return PaddleOCR(
+        use_angle_cls=True, 
+        lang='en', 
+        ocr_version=OCR_VERSION,
+        use_gpu=False
+    )
 
 ocr_engine = get_ocr_engine()
 
@@ -54,8 +61,6 @@ def surgical_crop(img, y_start, y_end, split_vertical=False, side="left"):
     try:
         crop = img.crop((x_start, y_start, x_end, y_end))
         crop_np = pil_to_numpy(crop)
-        
-        # FIXED: Removed 'cls=True' to prevent argument errors
         result = ocr_engine.ocr(crop_np)
         
         full_text = ""
@@ -84,8 +89,6 @@ def extract_full_data_paddle(file):
 
         # 1. Get Landmarks (Full Page Scan)
         img_np = pil_to_numpy(img)
-        
-        # FIXED: Removed 'cls=True'
         raw_results = ocr_engine.ocr(img_np)
         
         flat_text = ""
@@ -114,7 +117,6 @@ def extract_full_data_paddle(file):
         products_text = ""
         if file.type == "application/pdf" and 'images' in locals() and len(images) > 1:
             p2_np = pil_to_numpy(prod_img)
-            # FIXED: Removed 'cls=True'
             p2_res = ocr_engine.ocr(p2_np)
             if p2_res and p2_res[0]:
                 for line in p2_res[0]: products_text += line[1][0] + "\n"
@@ -234,12 +236,12 @@ def validate_compliance(data):
 # --- APP UI ---
 st.set_page_config(page_title="VeriPura Compliance Tool", layout="wide")
 st.title("🇪🇺 VeriPura Compliance Engine")
-st.markdown("**Engine:** PaddleOCR (Neural Network) | **Mode:** Spatial Grid")
+st.markdown("**Engine:** PaddleOCR (Mobile) | **Mode:** Spatial Grid")
 
 uploaded_file = st.file_uploader("Upload TRACES Certificate", type=['png', 'jpg', 'pdf'])
 
 if uploaded_file:
-    with st.spinner('Initializing PaddleOCR & Scanning... (First run takes 1 min)'):
+    with st.spinner('Initializing AI & Scanning...'):
         data = extract_full_data_paddle(uploaded_file)
         
         if data:
