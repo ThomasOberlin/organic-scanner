@@ -1,0 +1,6 @@
+streamlit
+pytesseract
+pdf2image
+python-dateutil
+pillow
+requests
