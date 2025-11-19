@@ -10,33 +10,26 @@ import re
 # --- CONFIGURATION ---
 SIMULATION_MODE = True 
 
-# --- INITIALIZE PADDLE OCR (The "Brain") ---
+# --- INITIALIZE PADDLE OCR ---
 @st.cache_resource
 def get_ocr_engine():
-    # We enable the angle classifier HERE, so we don't need to ask for it later
-    return PaddleOCR(use_angle_cls=True, lang='en', show_log=False)
+    # FIXED: Removed 'show_log=False' which was causing the crash
+    return PaddleOCR(use_angle_cls=True, lang='en')
 
 ocr_engine = get_ocr_engine()
 
 # --- IMAGE PROCESSING ---
 def preprocess_image(img):
-    """
-    Standard enhancement for OCR.
-    """
     img = ImageOps.grayscale(img)
     enhancer = ImageEnhance.Contrast(img)
     img = enhancer.enhance(1.5)
     return img
 
 def pil_to_numpy(img):
-    """Converts PIL Image to Numpy Array for PaddleOCR"""
     return np.array(img.convert("RGB"))
 
 # --- SPATIAL EXTRACTION ---
 def find_anchor_y(ocr_data, keywords):
-    """
-    Finds the Y-coordinate of a keyword using Paddle's result format.
-    """
     # Paddle format: [ [ [ [x1,y1]..], ("text", conf) ] ... ]
     for line in ocr_data:
         box, (text, conf) = line
@@ -46,9 +39,6 @@ def find_anchor_y(ocr_data, keywords):
     return None
 
 def surgical_crop(img, y_start, y_end, split_vertical=False, side="left"):
-    """
-    Cuts the image and runs PaddleOCR on the specific zone.
-    """
     w, h = img.size
     if y_start is None: y_start = 0
     if y_end is None: y_end = h
@@ -64,7 +54,8 @@ def surgical_crop(img, y_start, y_end, split_vertical=False, side="left"):
     try:
         crop = img.crop((x_start, y_start, x_end, y_end))
         crop_np = pil_to_numpy(crop)
-        # FIX: Removed cls=True here
+        
+        # FIXED: Removed 'cls=True' to prevent argument errors
         result = ocr_engine.ocr(crop_np)
         
         full_text = ""
@@ -81,6 +72,7 @@ def extract_full_data_paddle(file):
     try:
         # Convert PDF/Image
         if file.type == "application/pdf":
+            # Memory Safe: Pages 1-2
             images = convert_from_bytes(file.read(), dpi=200, first_page=1, last_page=2)
             img = preprocess_image(images[0])
             prod_img = preprocess_image(images[1]) if len(images) > 1 else img
@@ -92,7 +84,8 @@ def extract_full_data_paddle(file):
 
         # 1. Get Landmarks (Full Page Scan)
         img_np = pil_to_numpy(img)
-        # FIX: Removed cls=True here
+        
+        # FIXED: Removed 'cls=True'
         raw_results = ocr_engine.ocr(img_np)
         
         flat_text = ""
@@ -121,7 +114,7 @@ def extract_full_data_paddle(file):
         products_text = ""
         if file.type == "application/pdf" and 'images' in locals() and len(images) > 1:
             p2_np = pil_to_numpy(prod_img)
-            # FIX: Removed cls=True here
+            # FIXED: Removed 'cls=True'
             p2_res = ocr_engine.ocr(p2_np)
             if p2_res and p2_res[0]:
                 for line in p2_res[0]: products_text += line[1][0] + "\n"
