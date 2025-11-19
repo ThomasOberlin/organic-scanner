@@ -10,36 +10,26 @@ import re
 # --- CONFIGURATION ---
 SIMULATION_MODE = True 
 
-# --- INITIALIZE PADDLE OCR (MOBILE VERSION) ---
+# --- INITIALIZE PADDLE OCR ---
 @st.cache_resource
 def get_ocr_engine():
-    # LOCKING TO MOBILE MODEL ('PP-OCRv4')
-    # use_gpu=False ensures CPU compatibility
-    # show_log removed to prevent errors
-    return PaddleOCR(
-        use_angle_cls=True, 
-        lang='en', 
-        ocr_version='PP-OCRv4', 
-        use_gpu=False
-    )
+    # FIXED: Removed 'use_gpu=False' which was causing the crash
+    return PaddleOCR(use_angle_cls=True, lang='en')
 
 ocr_engine = get_ocr_engine()
 
 # --- IMAGE PROCESSING ---
 def preprocess_image(img):
-    """Standard enhancement for OCR."""
     img = ImageOps.grayscale(img)
     enhancer = ImageEnhance.Contrast(img)
     img = enhancer.enhance(1.5)
     return img
 
 def pil_to_numpy(img):
-    """Converts PIL Image to Numpy Array for PaddleOCR"""
     return np.array(img.convert("RGB"))
 
 # --- SPATIAL EXTRACTION ---
 def find_anchor_y(ocr_data, keywords):
-    """Finds Y-coordinate of a keyword."""
     # Paddle format: [ [ [ [x1,y1]..], ("text", conf) ] ... ]
     for line in ocr_data:
         box, (text, conf) = line
@@ -49,12 +39,10 @@ def find_anchor_y(ocr_data, keywords):
     return None
 
 def surgical_crop(img, y_start, y_end, split_vertical=False, side="left"):
-    """Cuts the image and runs PaddleOCR on the specific zone."""
     w, h = img.size
     if y_start is None: y_start = 0
     if y_end is None: y_end = h
     
-    # Crash Protection: Ensure Bottom is below Top
     if y_end <= y_start: y_end = min(y_start + 500, h)
 
     if split_vertical:
@@ -67,7 +55,7 @@ def surgical_crop(img, y_start, y_end, split_vertical=False, side="left"):
         crop = img.crop((x_start, y_start, x_end, y_end))
         crop_np = pil_to_numpy(crop)
         
-        # Run OCR on the crop
+        # FIXED: Removed 'cls=True' to prevent argument errors
         result = ocr_engine.ocr(crop_np)
         
         full_text = ""
@@ -84,7 +72,7 @@ def extract_full_data_paddle(file):
     try:
         # Convert PDF/Image
         if file.type == "application/pdf":
-            # MEMORY SAFETY: Only convert first 2 pages
+            # Memory Safe: Pages 1-2
             images = convert_from_bytes(file.read(), dpi=200, first_page=1, last_page=2)
             img = preprocess_image(images[0])
             prod_img = preprocess_image(images[1]) if len(images) > 1 else img
@@ -94,8 +82,10 @@ def extract_full_data_paddle(file):
             img = preprocess_image(img)
             prod_img = img
 
-        # 1. Full Page Scan (Landmarks)
+        # 1. Get Landmarks (Full Page Scan)
         img_np = pil_to_numpy(img)
+        
+        # FIXED: Removed 'cls=True'
         raw_results = ocr_engine.ocr(img_np)
         
         flat_text = ""
@@ -124,6 +114,7 @@ def extract_full_data_paddle(file):
         products_text = ""
         if file.type == "application/pdf" and 'images' in locals() and len(images) > 1:
             p2_np = pil_to_numpy(prod_img)
+            # FIXED: Removed 'cls=True'
             p2_res = ocr_engine.ocr(p2_np)
             if p2_res and p2_res[0]:
                 for line in p2_res[0]: products_text += line[1][0] + "\n"
@@ -142,7 +133,7 @@ def extract_full_data_paddle(file):
         st.error(f"Processing Error: {e}")
         return None
 
-# --- PARSING LOGIC ---
+# --- PARSING ---
 def parse_checkbox_products(text):
     lines = text.split('\n')
     active = []
@@ -182,7 +173,6 @@ def find_smart_date(text):
 def validate_compliance(data):
     report = {"score": 0, "total": 8, "details": []}
     
-    # Doc ID
     doc_num = re.search(r'[A-Z]{2}-.*?-\d+', data['header'])
     if not doc_num: doc_num = re.search(r'0\d{4,}', data['header'])
     if doc_num:
@@ -191,14 +181,12 @@ def validate_compliance(data):
     else:
         report["details"].append("❌ (1) Document ID Missing")
 
-    # Operator
     if len(data['operator']) > 5:
         report["score"] += 1
         report["details"].append("✅ (2) Operator Details Found")
     else:
         report["details"].append("❌ (2) Operator Details Unclear")
 
-    # Authority
     cb_code = re.search(r'[A-Z]{2}-[A-ZÖÄÜ]{3,}-\d+', data['authority']) or re.search(r'[A-Z]{2}-[A-Z]{3,}-\d+', data['full_text'])
     if cb_code:
         report["score"] += 1
@@ -206,14 +194,12 @@ def validate_compliance(data):
     else:
         report["details"].append("⚠️ (2) Control Body Code not found")
 
-    # Activity
     if "activity" in data['full_text'].lower():
         report["score"] += 1
         report["details"].append("✅ (3) Activities Found")
     else:
         report["details"].append("⚠️ (3) Activities Missing")
 
-    # Products
     active_prods = parse_checkbox_products(data['products'])
     if len(active_prods) > 0:
         report["score"] += 1
@@ -221,21 +207,18 @@ def validate_compliance(data):
     else:
         report["details"].append("❌ (4) No Active Products")
 
-    # Legal
     if "2018/848" in data['full_text'] or "2021/1378" in data['full_text']:
         report["score"] += 1
         report["details"].append("✅ (7) EU Regulation Cited")
     else:
         report["details"].append("❌ (7) Missing Legal Reference")
 
-    # Seal
     if "electronically signed" in data['full_text'].lower() or "traces" in data['full_text'].lower():
         report["score"] += 1
         report["details"].append("✅ (8) Electronic Seal")
     else:
         report["details"].append("⚠️ (8) Seal Not Detected")
 
-    # Dates
     expiry = find_smart_date(data['full_text'])
     if expiry:
         if expiry > datetime.now():
@@ -251,12 +234,12 @@ def validate_compliance(data):
 # --- APP UI ---
 st.set_page_config(page_title="VeriPura Compliance Tool", layout="wide")
 st.title("🇪🇺 VeriPura Compliance Engine")
-st.markdown("**Engine:** PaddleOCR (Mobile v4) | **Mode:** Spatial Grid")
+st.markdown("**Engine:** PaddleOCR (Neural Network) | **Mode:** Spatial Grid")
 
 uploaded_file = st.file_uploader("Upload TRACES Certificate", type=['png', 'jpg', 'pdf'])
 
 if uploaded_file:
-    with st.spinner('Initializing PaddleOCR (Mobile)...'):
+    with st.spinner('Initializing PaddleOCR & Scanning... (First run takes 1 min)'):
         data = extract_full_data_paddle(uploaded_file)
         
         if data:
