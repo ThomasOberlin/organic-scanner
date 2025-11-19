@@ -13,8 +13,8 @@ SIMULATION_MODE = True
 # --- INITIALIZE PADDLE OCR ---
 @st.cache_resource
 def get_ocr_engine():
-    # We set use_angle_cls=True here ONCE. 
-    # We do not need to pass it again during scanning.
+    # CORRECTED INITIALIZATION:
+    # We removed 'use_gpu' and 'show_log' because they cause crashes in the new version.
     return PaddleOCR(use_angle_cls=True, lang='en')
 
 ocr_engine = get_ocr_engine()
@@ -57,7 +57,7 @@ def surgical_crop(img, y_start, y_end, split_vertical=False, side="left"):
         crop = img.crop((x_start, y_start, x_end, y_end))
         crop_np = pil_to_numpy(crop)
         
-        # FIXED: Removed 'cls=' argument completely
+        # Removed 'cls=' argument to prevent errors
         result = ocr_engine.ocr(crop_np)
         
         full_text = ""
@@ -86,8 +86,7 @@ def extract_full_data_paddle(file):
 
         # 1. Get Landmarks (Full Page Scan)
         img_np = pil_to_numpy(img)
-        
-        # FIXED: Removed 'cls=' argument completely
+        # Removed 'cls=' argument
         raw_results = ocr_engine.ocr(img_np)
         
         flat_text = ""
@@ -116,7 +115,6 @@ def extract_full_data_paddle(file):
         products_text = ""
         if file.type == "application/pdf" and 'images' in locals() and len(images) > 1:
             p2_np = pil_to_numpy(prod_img)
-            # FIXED: Removed 'cls=' argument completely
             p2_res = ocr_engine.ocr(p2_np)
             if p2_res and p2_res[0]:
                 for line in p2_res[0]: products_text += line[1][0] + "\n"
